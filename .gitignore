@@ -1,0 +1,8 @@
+
+# build artifacts
+build/
+*.o
+*.out
+
+# OS junk
+.DS_Store
