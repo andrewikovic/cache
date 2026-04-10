@@ -7,7 +7,7 @@ This repository showcases a low-level performance engineering project in C99 cen
 
 The implementation includes a configurable cache simulator and a cache-optimized matrix transpose, both written under strict correctness and implementation constraints. The project highlights practical skills in systems programming, memory hierarchy reasoning, and performance-focused algorithm design.
 
-> Detailed design note: [Technical Design Note](/Users/ikovic/Documents/cache/docs/TECHNICAL_DETAILS.md)
+> Detailed design note: [Technical Design Note](./docs/TECHNICAL_DETAILS.md)
 
 ## Project Summary
 
@@ -15,7 +15,7 @@ The codebase is organized around two components:
 
 ### 1. Cache Simulator
 
-[`csim.c`](/Users/ikovic/Documents/cache/csim.c) implements a command-line cache simulator that models:
+[`csim.c`](./csim.c) implements a command-line cache simulator that models:
 
 - configurable set count, associativity, and block size
 - `L`, `S`, and `M` memory access operations from trace files
@@ -26,7 +26,7 @@ The simulator uses dynamically allocated cache sets and line metadata only, whic
 
 ### 2. Cache-Optimized Matrix Transpose
 
-[`trans.c`](/Users/ikovic/Documents/cache/trans.c) implements size-specific transpose strategies designed for a direct-mapped cache:
+[`trans.c`](./trans.c) implements size-specific transpose strategies designed for a direct-mapped cache:
 
 - `32x32`: `8x8` blocking with scalar register staging
 - `64x64`: quadrant-aware blocking to reduce conflict misses
@@ -121,13 +121,13 @@ python2 ./driver.py
 
 ## Repository Layout
 
-- [`csim.c`](/Users/ikovic/Documents/cache/csim.c): cache simulator implementation
-- [`trans.c`](/Users/ikovic/Documents/cache/trans.c): cache-aware transpose implementation
-- [`Makefile`](/Users/ikovic/Documents/cache/Makefile): build targets and test commands
-- [`cachelab.h`](/Users/ikovic/Documents/cache/cachelab.h): helper interfaces used by the project
-- [`docs/TECHNICAL_DETAILS.md`](/Users/ikovic/Documents/cache/docs/TECHNICAL_DETAILS.md): detailed design and performance writeup
-- [`README.handout.md`](/Users/ikovic/Documents/cache/README.handout.md): original handout preserved for reference
+- [`csim.c`](./csim.c): cache simulator implementation
+- [`trans.c`](./trans.c): cache-aware transpose implementation
+- [`Makefile`](./Makefile): build targets and test commands
+- [`cachelab.h`](./cachelab.h): helper interfaces used by the project
+- [`docs/TECHNICAL_DETAILS.md`](./docs/TECHNICAL_DETAILS.md): detailed design and performance writeup
+- [`README.handout.md`](./README.handout.md): original handout preserved for reference
 
 ## Background
 
-This project originated from the CS:APP Cache Lab starter repository, but the implementation, optimization work, and documentation here are presented as a standalone systems programming project. The original handout remains available in [`README.handout.md`](/Users/ikovic/Documents/cache/README.handout.md) for historical context.
+This project originated from the CS:APP Cache Lab starter repository, but the implementation, optimization work, and documentation here are presented as a standalone systems programming project. The original handout remains available in [`README.handout.md`](./README.handout.md) for historical context.

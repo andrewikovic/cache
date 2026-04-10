@@ -1,10 +1,10 @@
 # Technical Design Note
 
-This document is the code-level deep dive for the current implementation in [csim.c](/Users/ikovic/Documents/cache/csim.c) and [trans.c](/Users/ikovic/Documents/cache/trans.c). It is intentionally more detailed than the main [README](/Users/ikovic/Documents/cache/README.md) and is written to match the repository as it exists now, not a hypothetical or generic Cache Lab solution.
+This document is the code-level deep dive for the current implementation in [csim.c](../csim.c) and [trans.c](../trans.c). It is intentionally more detailed than the main [README](../README.md) and is written to match the repository as it exists now, not a hypothetical or generic Cache Lab solution.
 
 ## Reader Guide
 
-The main [README](/Users/ikovic/Documents/cache/README.md) is optimized for quick comprehension. This document is optimized for technical review. It is written in the style of a design note:
+The main [README](../README.md) is optimized for quick comprehension. This document is optimized for technical review. It is written in the style of a design note:
 
 - first define the machine model
 - then explain the simulator architecture
@@ -17,9 +17,9 @@ If someone reads only one part of this file, the most valuable section is the `6
 
 This writeup describes:
 
-- the cache simulator currently implemented in [csim.c](/Users/ikovic/Documents/cache/csim.c)
-- the transpose implementation currently implemented in [trans.c](/Users/ikovic/Documents/cache/trans.c)
-- the grading thresholds currently defined in [driver.py](/Users/ikovic/Documents/cache/driver.py)
+- the cache simulator currently implemented in [csim.c](../csim.c)
+- the transpose implementation currently implemented in [trans.c](../trans.c)
+- the grading thresholds currently defined in [driver.py](../driver.py)
 
 Where possible, the explanations below use excerpts from the actual code so the document stays aligned with the implementation.
 
@@ -32,7 +32,7 @@ The transpose component is evaluated against the standard Cache Lab configuratio
 - block size: `32 bytes`
 - element size: `4-byte int`
 
-That means each cache block holds exactly `8` integers. This drives several design choices in [trans.c](/Users/ikovic/Documents/cache/trans.c):
+That means each cache block holds exactly `8` integers. This drives several design choices in [trans.c](../trans.c):
 
 - loading `8` contiguous integers from a row is ideal because it fills exactly one block
 - transposed writes are inherently more hostile to locality than source reads
@@ -75,7 +75,7 @@ That quadrant naming matches the conceptual decomposition used in the code, even
 
 ## Part A: Cache Simulator
 
-File: [csim.c](/Users/ikovic/Documents/cache/csim.c)
+File: [csim.c](../csim.c)
 
 ### Design Goals
 
@@ -436,7 +436,7 @@ This is a perfect correctness score and means the simulator matched the referenc
 
 ## Part B: Cache-Aware Matrix Transpose
 
-File: [trans.c](/Users/ikovic/Documents/cache/trans.c)
+File: [trans.c](../trans.c)
 
 ### Design Constraints Reflected in the Code
 
@@ -542,7 +542,7 @@ This implementation does not use a separate diagonal-special-case path. The code
 
 - `32x32`: `287` misses
 
-That is well within the full-score threshold defined in [driver.py](/Users/ikovic/Documents/cache/driver.py).
+That is well within the full-score threshold defined in [driver.py](../driver.py).
 
 ## `64x64` Implementation
 
@@ -829,7 +829,7 @@ That is inside the full-score threshold in the current driver.
 
 ## Exact Scoring Thresholds in This Repository
 
-The performance thresholds are not just folklore. The current [driver.py](/Users/ikovic/Documents/cache/driver.py) uses:
+The performance thresholds are not just folklore. The current [driver.py](../driver.py) uses:
 
 ```python
 trans32_score = computeMissScore(miss32, 300, 600, maxscore['trans32']) * int(result32[0])
@@ -911,7 +911,7 @@ The code was validated on Linux using the provided build system and test tooling
 
 This matters because:
 
-- [test-csim](/Users/ikovic/Documents/cache/test-csim) and [csim-ref](/Users/ikovic/Documents/cache/csim-ref) are Linux ELF binaries
+- [test-csim](../test-csim) and [csim-ref](../csim-ref) are Linux ELF binaries
 - the repository's original tooling is not fully portable across modern non-Linux environments
 
 ## Resume-Style Summary
