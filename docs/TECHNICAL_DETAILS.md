@@ -23,6 +23,18 @@ This writeup describes:
 
 Where possible, the explanations below use excerpts from the actual code so the document stays aligned with the implementation.
 
+## Review Targets
+
+A stronger technical design note should make these questions easy to answer without opening the source first:
+
+- What are the entry points, helpers, and responsibilities?
+- What invariants are maintained across the implementation?
+- What address calculations drive the cache behavior?
+- What exact code paths handle normal, boundary, and failure cases?
+- What measured evidence supports the design choices?
+
+The rest of this document is organized around those review targets. Code snippets are intentionally small enough to audit, but specific enough that a reviewer can map them directly back to the implementation.
+
 ## Problem Model
 
 The transpose component is evaluated against the standard Cache Lab configuration:
@@ -87,6 +99,21 @@ The simulator is built around a few practical goals:
 - handle 64-bit traces safely
 - implement LRU without pointer-heavy bookkeeping
 
+### Function Map
+
+The simulator is small enough that each helper has one main responsibility:
+
+| Function | Responsibility | Design reason |
+| --- | --- | --- |
+| `parse_int_arg` | Convert command-line numeric arguments into validated `int` values | Keeps malformed input handling out of `main` |
+| `init_cache` | Allocate and initialize all cache metadata | Gives the simulator one explicit construction path |
+| `free_cache` | Release every set and line array | Makes cleanup symmetrical with allocation |
+| `access_cache` | Simulate one data-memory access | Centralizes hit, miss, eviction, and LRU behavior |
+| `print_result_tokens` | Print verbose `hit`, `miss`, and `eviction` tokens | Keeps formatting separate from cache state mutation |
+| `main` | Parse arguments, stream the trace, dispatch operations, and print the summary | Matches the assignment's command-line interface |
+
+That split keeps the important behavioral contract narrow: if `access_cache` is correct, then `main` only needs to call it the right number of times for each trace operation.
+
 ### Cache Representation
 
 The simulator models the cache explicitly as sets containing lines:
@@ -122,6 +149,28 @@ Only metadata is stored:
 - `last_used`
 
 No block payload is allocated, because the grading logic depends only on cache metadata and replacement behavior.
+
+### Simulator Invariants
+
+The implementation relies on a few simple invariants:
+
+```text
+/* Cache shape after init_cache succeeds. */
+cache->sets != NULL;
+set_count == (1ULL << cache->s);
+each set has exactly cache->E CacheLine entries;
+
+/* Line metadata meaning. */
+line->valid == 0 means line->tag and line->last_used are irrelevant;
+line->valid == 1 means line->tag identifies the cached block;
+line->last_used is meaningful only for valid lines;
+
+/* Counter relationship after any sequence of data accesses. */
+cache->hits + cache->misses == number_of_access_cache_calls;
+cache->evictions <= cache->misses;
+```
+
+The last relationship is especially useful for reviewing correctness. A cache access can hit, miss without eviction, or miss with eviction; there is no valid path where an eviction occurs without a miss.
 
 ### Command-Line Parsing and Validation
 
@@ -236,6 +285,23 @@ tag = address >> (cache->s + cache->b);
 
 Using `unsigned long long` for `address`, `tag`, `set_mask`, and `timestamp` keeps the simulator safe for 64-bit traces and high-bit values.
 
+For example, with `s = 4`, `b = 4`, and `address = 0x10`:
+
+```c
+set_mask  = (1ULL << 4) - 1ULL;          /* 0xf */
+set_index = (0x10ULL >> 4) & set_mask;   /* 0x1 */
+tag       = 0x10ULL >> (4 + 4);          /* 0x0 */
+```
+
+With the same configuration, `address = 0x110` maps to the same set but a different tag:
+
+```c
+set_index = (0x110ULL >> 4) & 0xfULL;    /* 0x1 */
+tag       = 0x110ULL >> 8;               /* 0x1 */
+```
+
+That is the exact conflict shape the simulator needs to model: same set, different tag, and therefore either a cold miss into an empty line or an eviction once all lines in the set are already valid.
+
 ### LRU Implementation
 
 LRU is implemented with a single monotonic timestamp stored in the `Cache` object. Every data access increments it:
@@ -307,6 +373,28 @@ This matches the intended behavior exactly:
 - fill invalid lines before evicting
 - evict the least recently used valid line only when the set is full
 
+### Return Flag Contract
+
+`access_cache` returns a bitmask so verbose printing can describe a single access without re-inspecting cache state:
+
+```c
+enum {
+    ACCESS_HIT = 1,
+    ACCESS_MISS = 2,
+    ACCESS_EVICTION = 4
+};
+```
+
+The legal results are intentionally limited:
+
+```c
+ACCESS_HIT;                       /* hit */
+ACCESS_MISS;                      /* miss */
+ACCESS_MISS | ACCESS_EVICTION;    /* miss eviction */
+```
+
+There is no `ACCESS_HIT | ACCESS_EVICTION` case because an eviction only happens after a miss in a full set. This representation also makes modify operations straightforward: `main` performs two ordinary accesses and prints both results.
+
 ### Control Flow Summary
 
 At a high level, the simulator's per-access decision tree looks like this:
@@ -369,6 +457,20 @@ This is an exact implementation of the lab rules:
 - `I` is ignored
 - `L` and `S` perform one access
 - `M` performs two accesses
+
+For a modify operation, the second access is guaranteed to hit because the first access either found the block or loaded it:
+
+```c
+/* Trace line: M 20,1 */
+first  = access_cache(&cache, 0x20ULL);  /* hit OR miss OR miss eviction */
+second = access_cache(&cache, 0x20ULL);  /* hit, because the block is now resident */
+```
+
+That is why the reference-style verbose output for a cold modify usually looks like:
+
+```text
+M 20,1 miss hit
+```
 
 ### Verbose Mode
 
@@ -465,6 +567,43 @@ void transpose_submit(int M, int N, int A[N][M], int B[M][N])
 
 One important detail: the code does not have a dedicated `transpose_61x67` helper by name. Instead, the generic helper is used for all sizes other than `32x32` and `64x64`. In graded use, that means it handles `61x67`.
 
+### Transpose Function Map
+
+| Function | Input shape | Strategy | Why this helper exists |
+| --- | --- | --- | --- |
+| `transpose_submit` | Any `M x N` accepted by the driver | Dispatch by known graded dimensions | Keeps the graded entry point small and auditable |
+| `transpose_32` | `32x32` | `8x8` blocking with scalar staging | Matches the `8 ints per cache line` geometry cleanly |
+| `transpose_64` | `64x64` | `8x8` tiles split into `4x4` quadrants | Avoids direct-mapped conflict misses that simple blocking triggers |
+| `transpose_generic` | Everything else, including `61x67` | `16x16` blocked traversal with clipped edges | Handles irregular dimensions without special-case code |
+| `trans` | Any shape | Simple row-wise baseline | Registered for comparison, not used as the optimized submission |
+
+### Row-Major Address Math
+
+The transpose code depends on C's row-major layout. For `A[N][M]` and `B[M][N]`, the addresses are:
+
+```c
+address_of_A_r_c = base_A + sizeof(int) * (r * M + c);
+address_of_B_c_r = base_B + sizeof(int) * (c * N + r);
+```
+
+Under the grading cache geometry, the set index for either matrix element is:
+
+```c
+set_index = (address >> 5) & 31;  /* b = 5, s = 5 */
+```
+
+This explains the asymmetry in the transpose loops:
+
+```c
+/* Good source locality: contiguous row elements. */
+A[k][j + 0], A[k][j + 1], A[k][j + 2], A[k][j + 3]
+
+/* Harder destination locality: transposed writes step through B rows. */
+B[j + 0][k], B[j + 1][k], B[j + 2][k], B[j + 3][k]
+```
+
+The helpers optimize around that mismatch: reads from `A` are naturally row-friendly, while writes to `B` need careful ordering to avoid repeated set conflicts.
+
 ## `32x32` Implementation
 
 ### Exact Strategy in the Current Code
@@ -537,6 +676,31 @@ Because each cache block holds `8` integers:
 - the tile is small enough that locality remains good without extra diagonal handling logic
 
 This implementation does not use a separate diagonal-special-case path. The code relies on simple blocked traversal plus scalar staging.
+
+The correctness invariant for one loaded row is:
+
+```c
+/* For one fixed k inside the 8x8 tile. */
+a0 == A[k][j + 0];
+a1 == A[k][j + 1];
+a2 == A[k][j + 2];
+a3 == A[k][j + 3];
+a4 == A[k][j + 4];
+a5 == A[k][j + 5];
+a6 == A[k][j + 6];
+a7 == A[k][j + 7];
+
+B[j + 0][k] == A[k][j + 0];
+B[j + 1][k] == A[k][j + 1];
+B[j + 2][k] == A[k][j + 2];
+B[j + 3][k] == A[k][j + 3];
+B[j + 4][k] == A[k][j + 4];
+B[j + 5][k] == A[k][j + 5];
+B[j + 6][k] == A[k][j + 6];
+B[j + 7][k] == A[k][j + 7];
+```
+
+Repeating that invariant for `k = i..i+7` completes the full tile.
 
 ### Result
 
@@ -642,7 +806,15 @@ j+4..j+7      |   unused    |   unused    |
               +-------------+-------------+
 ```
 
-That is why phase 1 looks slightly odd in code: it is intentionally writing the upper-right values into a temporary holding area inside the left half of the destination tile.
+That is why phase 1 looks slightly odd in code: it is intentionally writing the upper-right values into a temporary holding area inside the upper-right quadrant of the destination tile.
+
+The postcondition after phase 1 is:
+
+```c
+/* For k = 0..3 and q = 0..3. */
+B[j + q][i + k]     == A[i + k][j + q];       /* UL^T final */
+B[j + q][i + k + 4] == A[i + k][j + q + 4];   /* UR^T staged */
+```
 
 ### Phase 2: Swap the Staged Values with the Lower-Left Quadrant
 
@@ -700,6 +872,16 @@ j+4..j+7      |    UR^T     |   pending   |
 
 This is the key step in the implementation. The code uses `B` as a controlled staging area so that upper-right and lower-left data can be reordered without forcing the worst-case direct-mapped collisions at the wrong time.
 
+The code-level postcondition after phase 2 is:
+
+```c
+/* For k = 0..3 and q = 0..3. */
+B[j + k][i + 4 + q] == A[i + 4 + q][j + k];   /* LL^T final */
+B[j + 4 + k][i + q] == A[i + q][j + 4 + k];   /* UR^T final */
+```
+
+Combined with phase 1, that means three quadrants are now complete: `UL^T`, `LL^T`, and `UR^T`.
+
 ### Phase 3: Write the Lower-Right Quadrant
 
 After the swap, the bottom-right `4x4` quadrant can be written directly:
@@ -733,6 +915,13 @@ j+4..j+7      |    UR^T     |    LR^T     |
               +-------------+-------------+
 ```
 
+The final quadrant invariant is:
+
+```c
+/* For k = 0..3 and q = 0..3. */
+B[j + 4 + q][i + 4 + k] == A[i + 4 + k][j + 4 + q];   /* LR^T final */
+```
+
 ### Why This Works
 
 This is not just "blocking." It is conflict-aware reordering.
@@ -746,14 +935,36 @@ The important idea is:
 An ASCII summary of the data movement is:
 
 ```text
-UL -> final top-left
-UR -> temporary left-bottom staging area
-LL -> final left-bottom, replacing staged UR
-UR -> final top-right after being pulled back out of staging
-LR -> final bottom-right
+UL -> final upper-left
+UR -> temporary upper-right staging area
+LL -> final upper-right, replacing staged UR
+UR -> final lower-left after being pulled back out of staging
+LR -> final lower-right
 ```
 
 That is what allows the implementation to avoid the large miss penalties that simpler `64x64` transposes incur on a direct-mapped cache.
+
+As compact pseudocode, one `8x8` tile behaves like this:
+
+```text
+/* Phase 1: top rows. */
+for k in 0..3:
+    load A[i + k][j..j + 7]
+    write UL to B[j..j + 3][i + k]
+    stage UR in B[j..j + 3][i + k + 4]
+
+/* Phase 2: left columns of bottom rows. */
+for k in 0..3:
+    read staged UR column from B[j + k][i + 4..i + 7]
+    load LL column from A[i + 4..i + 7][j + k]
+    write LL to B[j + k][i + 4..i + 7]
+    move staged UR to B[j + 4 + k][i..i + 3]
+
+/* Phase 3: bottom-right rows. */
+for k in 0..3:
+    load LR row from A[i + 4 + k][j + 4..j + 7]
+    write LR to B[j + 4..j + 7][i + 4 + k]
+```
 
 ### Result
 
@@ -820,6 +1031,23 @@ for (k = i; k < N && k < i + 16; ++k) {
 ```
 
 That boundary logic is the whole reason the generic helper remains robust without requiring a separate irregular-case implementation.
+
+The same logic can be read as an explicit clipped-tile contract:
+
+```c
+row_start = i;
+row_end = (i + 16 < N) ? i + 16 : N;
+col_start = j;
+col_end = (j + 16 < M) ? j + 16 : M;
+
+for (k = row_start; k < row_end; ++k) {
+    for (l = col_start; l < col_end; ++l) {
+        B[l][k] = A[k][l];
+    }
+}
+```
+
+For the last `61x67` row tile, that means `row_start = 64` and `row_end = 67`, so only rows `64`, `65`, and `66` are touched. For the last column tile, `col_start = 48` and `col_end = 61`, so only columns `48..60` are touched. No out-of-bounds access is possible as long as the loop guards stay in that form.
 
 ### Result
 
