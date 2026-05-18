@@ -1,122 +1,211 @@
-# Technical Design Note
+# Technical Design Document
 
-This document is the code-level deep dive for the current implementation in [csim.c](../csim.c) and [trans.c](../trans.c). It is intentionally more detailed than the main [README](../README.md) and is written to match the repository as it exists now, not a hypothetical or generic Cache Lab solution.
+This document is a comprehensive technical design guide for this Cache Lab repository. It explains the implementation as it exists in the current codebase, with the source files as the source of truth:
+
+- [csim.c](../csim.c): configurable cache simulator
+- [trans.c](../trans.c): cache-aware matrix transpose implementation
+- [cachelab.c](../cachelab.c) and [cachelab.h](../cachelab.h): grading helper interfaces
+- [test-trans.c](../test-trans.c), [tracegen.c](../tracegen.c), and [driver.py](../driver.py): evaluation harness
+- [Makefile](../Makefile): build rules
+
+The project has two independent but related parts:
+
+1. A simulator that models cache hits, misses, and evictions for Valgrind-style traces.
+2. A matrix transpose implementation tuned for the direct-mapped cache model used by the lab driver.
+
+The key design theme across both parts is that the code does not simulate or optimize more than the grading model needs. The simulator stores only line metadata, because hit/miss behavior depends only on validity, tags, and replacement order. The transpose code uses explicit scalar movement and fixed tile schedules, because the benchmark rewards controlling cache-line residency and avoiding direct-mapped conflicts.
 
 ## Reader Guide
 
-The main [README](../README.md) is optimized for quick comprehension. This document is optimized for technical review. It is written in the style of a design note:
+This is a code-level design document, not a quick-start guide. For a shorter project overview, use [README.md](../README.md). For implementation review, read this document in this order:
 
-- first define the machine model
-- then explain the simulator architecture
-- then walk through the transpose strategy with the same tile structure the code uses
-- finally tie the implementation to the measured results and current driver thresholds
+1. **High-Level Architecture** for the runtime flow.
+2. **Shared Cache Model** for the cache geometry used by both parts.
+3. **Part A: Cache Simulator Design** for `csim.c` internals.
+4. **Part B: Matrix Transpose Design** for `trans.c` internals.
+5. **Evaluation Harness Design** for how the driver measures correctness and misses.
+6. **Correctness Contracts** and **Review Checklist** before modifying code.
 
-If someone reads only one part of this file, the most valuable section is the `64x64` transpose discussion because that is where the implementation demonstrates the most deliberate cache-aware reasoning.
+The recorded performance numbers in this document come from the project's existing documented Linux validation results. The current macOS workspace can run the locally built `csim` binary directly, but the original `test-csim`, `csim-ref`, and full transpose performance path require a Linux-compatible environment and, for transpose, Valgrind.
 
-## Scope and Source of Truth
+## High-Level Architecture
 
-This writeup describes:
+The repository is small, but the runtime flow has several moving pieces. The simulator path is direct: parse a trace, update cache metadata, and report the final counters.
 
-- the cache simulator currently implemented in [csim.c](../csim.c)
-- the transpose implementation currently implemented in [trans.c](../trans.c)
-- the grading thresholds currently defined in [driver.py](../driver.py)
-
-Where possible, the explanations below use excerpts from the actual code so the document stays aligned with the implementation.
-
-## Review Targets
-
-A stronger technical design note should make these questions easy to answer without opening the source first:
-
-- What are the entry points, helpers, and responsibilities?
-- What invariants are maintained across the implementation?
-- What address calculations drive the cache behavior?
-- What exact code paths handle normal, boundary, and failure cases?
-- What measured evidence supports the design choices?
-
-The rest of this document is organized around those review targets. Code snippets are intentionally small enough to audit, but specific enough that a reviewer can map them directly back to the implementation.
-
-## Problem Model
-
-The transpose component is evaluated against the standard Cache Lab configuration:
-
-- cache size: `1 KB`
-- associativity: direct-mapped for transpose evaluation (`E = 1`)
-- block size: `32 bytes`
-- element size: `4-byte int`
-
-That means each cache block holds exactly `8` integers. This drives several design choices in [trans.c](../trans.c):
-
-- loading `8` contiguous integers from a row is ideal because it fills exactly one block
-- transposed writes are inherently more hostile to locality than source reads
-- `64x64` is the hardest case because source and destination regions repeatedly map onto the same cache sets in a direct-mapped cache
-
-### Memory Geometry Snapshot
-
-```text
-Cache size          = 1024 bytes
-Block size          =   32 bytes
-Cache lines         = 1024 / 32 = 32
-Bytes per int       =    4
-Ints per cache line =   32 / 4  = 8
+```mermaid
+flowchart TD
+    Trace["Trace file"] --> Parse["csim.c parses L/S/M operations"]
+    Parse --> Access["access_cache updates cache metadata"]
+    Access --> Counters["hits, misses, evictions"]
+    Counters --> Summary["printSummary writes stdout and .csim_results"]
 ```
 
-That simple `8 ints per line` fact is the foundation of the transpose code:
+The transpose path is more involved because the driver measures memory references rather than wall-clock time.
 
-- `transpose_32` loads exactly `8` values from one source row at a time
-- `transpose_64` still works on `8x8` tiles, but reorders writes to avoid set conflicts
-- `transpose_generic` uses larger blocked traversal because the irregular case is less about exact tile choreography and more about preserving locality while clipping edges safely
-
-### Tile Vocabulary Used Below
-
-For the `64x64` explanation, it helps to name the four `4x4` quadrants inside one `8x8` tile:
-
-```text
-A tile covering rows i..i+7 and cols j..j+7
-
-                j..j+3       j+4..j+7
-              +-----------+-----------+
-i..i+3        |    UL     |    UR     |
-              |   4 x 4   |   4 x 4   |
-              +-----------+-----------+
-i+4..i+7      |    LL     |    LR     |
-              |   4 x 4   |   4 x 4   |
-              +-----------+-----------+
+```mermaid
+flowchart TD
+    TestTrans["test-trans"] --> Tracegen["tracegen invokes registered transpose function"]
+    Tracegen --> Valgrind["Valgrind lackey records memory references"]
+    Valgrind --> Filter["test-trans filters marker-bounded trace window"]
+    Filter --> RefSim["csim-ref evaluates trace with s=5, E=1, b=5"]
+    RefSim --> Driver["driver.py converts correctness and misses into score"]
 ```
 
-That quadrant naming matches the conceptual decomposition used in the code, even though the code itself is written directly in terms of scalar loads and stores.
+The optimized submission entry point is `transpose_submit` in [trans.c](../trans.c). It dispatches by matrix size:
 
-## Part A: Cache Simulator
+```c
+void transpose_submit(int M, int N, int A[N][M], int B[M][N])
+{
+    if (M == 32 && N == 32) {
+        transpose_32(M, N, A, B);
+    } else if (M == 64 && N == 64) {
+        transpose_64(M, N, A, B);
+    } else {
+        transpose_generic(M, N, A, B);
+    }
+}
+```
+
+That dispatch matches the three graded transpose workloads:
+
+- `32x32`
+- `64x64`
+- `61x67`
+
+There is no named `transpose_61x67` function. The irregular workload is handled by the generic blocked helper.
+
+## Repository Map
+
+| Path | Role |
+| --- | --- |
+| [csim.c](../csim.c) | Student cache simulator for Part A |
+| [trans.c](../trans.c) | Student transpose implementation for Part B |
+| [cachelab.c](../cachelab.c) | Shared helper implementation used by simulator and transpose tests |
+| [cachelab.h](../cachelab.h) | Shared type declarations and helper prototypes |
+| [driver.py](../driver.py) | Original Python 2 grading driver |
+| [test-trans.c](../test-trans.c) | Transpose correctness and performance harness |
+| [tracegen.c](../tracegen.c) | Invokes transpose functions under Valgrind trace generation |
+| [test-csim](../test-csim) | Prebuilt simulator checker |
+| [csim-ref](../csim-ref) | Prebuilt reference simulator used by transpose evaluation |
+| [traces/](../traces) | Simulator trace inputs |
+| [Makefile](../Makefile) | Build and cleanup rules |
+
+## Build And Platform Model
+
+The original assignment tooling assumes Linux `x86_64`. The repository currently contains a locally built `csim` executable for macOS arm64, while `test-csim` and `csim-ref` are Linux ELF binaries. That means:
+
+- `./csim` can be run directly in the current macOS workspace.
+- `./test-csim`, `./csim-ref`, and the full original driver need a Linux-compatible environment.
+- The official transpose performance path also needs `valgrind`.
+
+The Makefile builds the C sources with strict warnings:
+
+```make
+CC = gcc
+CFLAGS = -g -Wall -Werror -std=c99 -m64
+
+all: csim test-trans tracegen
+	# Generate a handin tar file each time you compile
+	-tar -cvf ${USER}-handin.tar  csim.c trans.c
+```
+
+The key build targets are:
+
+```make
+csim: csim.c cachelab.c cachelab.h
+	$(CC) $(CFLAGS) -o csim csim.c cachelab.c -lm
+
+test-trans: test-trans.c trans.o cachelab.c cachelab.h
+	$(CC) $(CFLAGS) -o test-trans test-trans.c cachelab.c trans.o
+
+tracegen: tracegen.c trans.o cachelab.c
+	$(CC) $(CFLAGS) -O0 -o tracegen tracegen.c trans.o cachelab.c
+```
+
+The `trans.o` target is compiled with `-O0`:
+
+```make
+trans.o: trans.c
+	$(CC) $(CFLAGS) -O0 -c trans.c
+```
+
+That matters for the transpose benchmark. The measured memory trace should reflect the written code instead of an aggressively transformed compiler output.
+
+## Shared Cache Model
+
+The simulator and transpose benchmark both use the standard cache-lab address model:
+
+```text
+address bits:
+
+| tag | set index | block offset |
+```
+
+For a cache with `s` set-index bits, `E` lines per set, and `b` block-offset bits:
+
+```text
+number of sets = 2^s
+block size     = 2^b bytes
+set index      = (address >> b) & ((1 << s) - 1)
+tag            = address >> (s + b)
+```
+
+The transpose grading cache is fixed by [test-trans.c](../test-trans.c):
+
+```c
+eval_perf(5, 1, 5);
+```
+
+So Part B is evaluated with:
+
+```text
+s = 5                 -> 32 sets
+E = 1                 -> direct-mapped cache
+b = 5                 -> 32-byte blocks
+cache capacity        -> 32 sets * 1 line/set * 32 bytes = 1024 bytes
+sizeof(int)           -> 4 bytes
+ints per cache block  -> 32 / 4 = 8 ints
+```
+
+The `8 ints per cache block` fact explains almost every transpose decision in [trans.c](../trans.c):
+
+- `32x32` uses `8x8` tiles.
+- `64x64` uses `8x8` tiles but splits each tile into `4x4` quadrants to avoid conflict misses.
+- The generic path uses larger clipped tiles because irregular dimensions make clean boundary handling more important than exact quadrant choreography.
+
+## Part A: Cache Simulator Design
 
 File: [csim.c](../csim.c)
 
-### Design Goals
+The simulator implements the Cache Lab command-line contract:
 
-The simulator is built around a few practical goals:
+```text
+Usage: ./csim [-hv] -s <num> -E <num> -b <num> -t <file>
 
-- match the reference simulator's hit, miss, and eviction behavior
-- keep the implementation simple enough to audit
-- avoid storing block contents that are irrelevant to grading
-- handle 64-bit traces safely
-- implement LRU without pointer-heavy bookkeeping
+-h         print help
+-v         verbose trace output
+-s <num>   number of set index bits
+-E <num>   lines per set
+-b <num>   number of block offset bits
+-t <file>  trace file
+```
 
-### Function Map
+It models only data-memory operations:
 
-The simulator is small enough that each helper has one main responsibility:
+- `I`: instruction fetch, ignored
+- `L`: load, one cache access
+- `S`: store, one cache access
+- `M`: modify, two cache accesses, equivalent to load then store
 
-| Function | Responsibility | Design reason |
-| --- | --- | --- |
-| `parse_int_arg` | Convert command-line numeric arguments into validated `int` values | Keeps malformed input handling out of `main` |
-| `init_cache` | Allocate and initialize all cache metadata | Gives the simulator one explicit construction path |
-| `free_cache` | Release every set and line array | Makes cleanup symmetrical with allocation |
-| `access_cache` | Simulate one data-memory access | Centralizes hit, miss, eviction, and LRU behavior |
-| `print_result_tokens` | Print verbose `hit`, `miss`, and `eviction` tokens | Keeps formatting separate from cache state mutation |
-| `main` | Parse arguments, stream the trace, dispatch operations, and print the summary | Matches the assignment's command-line interface |
+The simulator does not need to model bytes inside a block. For hit/miss/eviction counts, each line needs only:
 
-That split keeps the important behavioral contract narrow: if `access_cache` is correct, then `main` only needs to call it the right number of times for each trace operation.
+- a valid bit
+- a tag
+- an LRU timestamp
 
-### Cache Representation
+### Simulator Data Structures
 
-The simulator models the cache explicitly as sets containing lines:
+[csim.c](../csim.c) defines three internal structures:
 
 ```c
 typedef struct {
@@ -142,39 +231,80 @@ typedef struct {
 } Cache;
 ```
 
-Only metadata is stored:
-
-- `valid`
-- `tag`
-- `last_used`
-
-No block payload is allocated, because the grading logic depends only on cache metadata and replacement behavior.
-
-### Simulator Invariants
-
-The implementation relies on a few simple invariants:
+This is an explicit set-associative cache:
 
 ```text
-/* Cache shape after init_cache succeeds. */
-cache->sets != NULL;
-set_count == (1ULL << cache->s);
-each set has exactly cache->E CacheLine entries;
-
-/* Line metadata meaning. */
-line->valid == 0 means line->tag and line->last_used are irrelevant;
-line->valid == 1 means line->tag identifies the cached block;
-line->last_used is meaningful only for valid lines;
-
-/* Counter relationship after any sequence of data accesses. */
-cache->hits + cache->misses == number_of_access_cache_calls;
-cache->evictions <= cache->misses;
+Cache
+  sets[0]
+    lines[0..E-1]
+  sets[1]
+    lines[0..E-1]
+  ...
+  sets[(1 << s) - 1]
+    lines[0..E-1]
 ```
 
-The last relationship is especially useful for reviewing correctness. A cache access can hit, miss without eviction, or miss with eviction; there is no valid path where an eviction occurs without a miss.
+The implementation keeps the following invariants after successful initialization:
 
-### Command-Line Parsing and Validation
+```text
+cache.sets != NULL
+number of sets == 1ULL << cache.s
+each set owns exactly cache.E CacheLine entries
+cache.timestamp starts at 0 and increases once per data access
+cache.hits, cache.misses, and cache.evictions start at 0
+```
 
-The simulator uses `getopt` and validates inputs before allocating the cache:
+For each line:
+
+```text
+valid == 0:
+    tag and last_used are ignored
+
+valid == 1:
+    tag identifies the resident memory block
+    last_used is the timestamp of the most recent access to that line
+```
+
+### Argument Parsing
+
+The CLI parser uses `getopt` and a dedicated numeric parser:
+
+```c
+static int parse_int_arg(const char *text, int allow_zero, int *value)
+{
+    long parsed;
+    char *endptr;
+
+    if (text == NULL || *text == '\0') {
+        return 0;
+    }
+
+    errno = 0;
+    parsed = strtol(text, &endptr, 10);
+    if (errno != 0 || *endptr != '\0') {
+        return 0;
+    }
+    if (parsed < 0 || parsed > INT_MAX) {
+        return 0;
+    }
+    if (!allow_zero && parsed == 0) {
+        return 0;
+    }
+
+    *value = (int)parsed;
+    return 1;
+}
+```
+
+The parser rejects:
+
+- null or empty text
+- non-decimal suffixes such as `12x`
+- values that overflow `int`
+- negative values
+- zero when the caller does not allow zero
+
+The option loop delegates validation to that helper:
 
 ```c
 while ((opt = getopt(argc, argv, "hvs:E:b:t:")) != -1) {
@@ -216,12 +346,12 @@ while ((opt = getopt(argc, argv, "hvs:E:b:t:")) != -1) {
 }
 ```
 
-Two details are worth noting because they reflect the actual code:
+Two details are intentional:
 
-- `E` must be nonzero
-- `s` and `b` are parsed with `allow_zero = 1`, so `0` is accepted for those fields
+- `E` must be positive, because a cache set with zero lines cannot be accessed safely.
+- `s` and `b` may be zero, because a one-set cache or one-byte block is still a meaningful model.
 
-The implementation also guards against unsafe shifts:
+After option parsing, the code verifies that all required options are present and that address shifts are safe:
 
 ```c
 if (!have_s || !have_E || !have_b || trace_path == NULL) {
@@ -234,148 +364,113 @@ if (s >= addr_bits || b >= addr_bits || s + b >= addr_bits) {
 }
 ```
 
-That check matters because the cache uses bit shifts to extract set index and tag, and the code should not rely on undefined behavior for oversized shifts.
+This prevents undefined behavior from shifts at or beyond the width of `unsigned long long`.
 
-### Allocation Strategy
+### Cache Allocation
 
-The cache allocates:
-
-- one array of `CacheSet`
-- one `CacheLine` array per set
-
-The allocation is sized directly from `s` and `E`:
+`init_cache` initializes the metadata fields and allocates a two-level cache:
 
 ```c
-set_count = 1ULL << s;
-cache->sets = (CacheSet *)calloc((size_t)set_count, sizeof(CacheSet));
-if (cache->sets == NULL) {
-    return 0;
-}
+static int init_cache(Cache *cache, int s, int E, int b)
+{
+    unsigned long long set_count;
+    unsigned long long set_index;
 
-for (set_index = 0; set_index < set_count; ++set_index) {
-    cache->sets[set_index].lines = (CacheLine *)calloc((size_t)E, sizeof(CacheLine));
-    if (cache->sets[set_index].lines == NULL) {
-        unsigned long long cleanup_index;
-        for (cleanup_index = 0; cleanup_index < set_index; ++cleanup_index) {
-            free(cache->sets[cleanup_index].lines);
-        }
-        free(cache->sets);
-        cache->sets = NULL;
+    cache->sets = NULL;
+    cache->s = s;
+    cache->E = E;
+    cache->b = b;
+    cache->set_mask = (s == 0) ? 0ULL : ((1ULL << s) - 1ULL);
+    cache->timestamp = 0ULL;
+    cache->hits = 0;
+    cache->misses = 0;
+    cache->evictions = 0;
+
+    set_count = 1ULL << s;
+    cache->sets = (CacheSet *)calloc((size_t)set_count, sizeof(CacheSet));
+    if (cache->sets == NULL) {
         return 0;
     }
+```
+
+Each set receives its own line array:
+
+```c
+    for (set_index = 0; set_index < set_count; ++set_index) {
+        cache->sets[set_index].lines = (CacheLine *)calloc((size_t)E, sizeof(CacheLine));
+        if (cache->sets[set_index].lines == NULL) {
+            unsigned long long cleanup_index;
+            for (cleanup_index = 0; cleanup_index < set_index; ++cleanup_index) {
+                free(cache->sets[cleanup_index].lines);
+            }
+            free(cache->sets);
+            cache->sets = NULL;
+            return 0;
+        }
+    }
+
+    return 1;
 }
 ```
 
-This is more robust than assuming a single allocation will always succeed. If allocation fails partway through, the code frees everything already allocated before returning failure.
+Using `calloc` gives every `valid` field an initial value of zero. The explicit cleanup path prevents leaks if allocation fails partway through.
+
+The matching deallocator is symmetrical:
+
+```c
+static void free_cache(Cache *cache)
+{
+    unsigned long long set_count;
+    unsigned long long set_index;
+
+    if (cache->sets == NULL) {
+        return;
+    }
+
+    set_count = 1ULL << cache->s;
+    for (set_index = 0; set_index < set_count; ++set_index) {
+        free(cache->sets[set_index].lines);
+    }
+    free(cache->sets);
+    cache->sets = NULL;
+}
+```
+
+The `cache->sets == NULL` guard makes cleanup safe on failure paths.
 
 ### Address Decomposition
 
-The implementation stores a precomputed `set_mask` in the cache object:
+The simulator precomputes `set_mask` once:
 
 ```c
 cache->set_mask = (s == 0) ? 0ULL : ((1ULL << s) - 1ULL);
 ```
 
-Then each access computes:
+Then each access extracts the set index and tag:
 
 ```c
 set_index = (address >> cache->b) & cache->set_mask;
 tag = address >> (cache->s + cache->b);
 ```
 
-Using `unsigned long long` for `address`, `tag`, `set_mask`, and `timestamp` keeps the simulator safe for 64-bit traces and high-bit values.
+Example with `s = 4`, `E = 1`, `b = 4`:
 
-For example, with `s = 4`, `b = 4`, and `address = 0x10`:
+```text
+address    = 0x10
+set_mask   = 0xf
+set_index  = (0x10 >> 4) & 0xf = 1
+tag        = 0x10 >> 8 = 0
 
-```c
-set_mask  = (1ULL << 4) - 1ULL;          /* 0xf */
-set_index = (0x10ULL >> 4) & set_mask;   /* 0x1 */
-tag       = 0x10ULL >> (4 + 4);          /* 0x0 */
+address    = 0x110
+set_index  = (0x110 >> 4) & 0xf = 1
+tag        = 0x110 >> 8 = 1
 ```
 
-With the same configuration, `address = 0x110` maps to the same set but a different tag:
+Those two addresses map to the same set but have different tags. In a direct-mapped cache, the second access evicts the first if the first is still resident.
 
-```c
-set_index = (0x110ULL >> 4) & 0xfULL;    /* 0x1 */
-tag       = 0x110ULL >> 8;               /* 0x1 */
-```
+### Access Result Flags
 
-That is the exact conflict shape the simulator needs to model: same set, different tag, and therefore either a cold miss into an empty line or an eviction once all lines in the set are already valid.
-
-### LRU Implementation
-
-LRU is implemented with a single monotonic timestamp stored in the `Cache` object. Every data access increments it:
-
-```c
-cache->timestamp += 1ULL;
-```
-
-This avoids:
-
-- per-set linked lists
-- line reordering after every hit
-- global aging passes
-
-The timestamp approach is a good fit here because:
-
-- it is simple to reason about
-- it keeps each access local to one set
-- the trace sizes in the lab are small enough that timestamp overflow is not a practical concern
-
-### Access Path
-
-The core behavior lives in `access_cache`, which performs a single pass over one set:
-
-```c
-for (line_index = 0; line_index < cache->E; ++line_index) {
-    CacheLine *line = &set->lines[line_index];
-
-    if (line->valid) {
-        if (line->tag == tag) {
-            line->last_used = cache->timestamp;
-            cache->hits += 1;
-            return ACCESS_HIT;
-        }
-        if (lru_line == NULL || line->last_used < lru_line->last_used) {
-            lru_line = line;
-        }
-    } else if (empty_line == NULL) {
-        empty_line = line;
-    }
-}
-```
-
-During that one pass, the code tracks:
-
-- a hit candidate
-- the first invalid line
-- the least recently used valid line
-
-If no hit occurs, the miss path is:
-
-```c
-cache->misses += 1;
-if (empty_line != NULL) {
-    empty_line->valid = 1;
-    empty_line->tag = tag;
-    empty_line->last_used = cache->timestamp;
-    return ACCESS_MISS;
-}
-
-lru_line->tag = tag;
-lru_line->last_used = cache->timestamp;
-cache->evictions += 1;
-return ACCESS_MISS | ACCESS_EVICTION;
-```
-
-This matches the intended behavior exactly:
-
-- fill invalid lines before evicting
-- evict the least recently used valid line only when the set is full
-
-### Return Flag Contract
-
-`access_cache` returns a bitmask so verbose printing can describe a single access without re-inspecting cache state:
+`access_cache` returns a bitmask that describes the outcome:
 
 ```c
 enum {
@@ -385,96 +480,204 @@ enum {
 };
 ```
 
-The legal results are intentionally limited:
-
-```c
-ACCESS_HIT;                       /* hit */
-ACCESS_MISS;                      /* miss */
-ACCESS_MISS | ACCESS_EVICTION;    /* miss eviction */
-```
-
-There is no `ACCESS_HIT | ACCESS_EVICTION` case because an eviction only happens after a miss in a full set. This representation also makes modify operations straightforward: `main` performs two ordinary accesses and prints both results.
-
-### Control Flow Summary
-
-At a high level, the simulator's per-access decision tree looks like this:
+The valid return values are:
 
 ```text
-parse trace op
-    |
-    +--> I : ignore
-    |
-    +--> L / S : one access_cache() call
-    |
-    +--> M : two access_cache() calls
-
-access_cache(address)
-    |
-    +--> scan one set
-           |
-           +--> tag match      -> hit
-           +--> invalid line   -> miss, fill
-           +--> otherwise      -> miss, evict LRU
+ACCESS_HIT                         -> hit
+ACCESS_MISS                        -> miss
+ACCESS_MISS | ACCESS_EVICTION      -> miss eviction
 ```
 
-That summary is intentionally simple because the actual code is intentionally simple. There is no hidden state machine beyond the line scan and timestamp updates shown above.
+There is no legal `ACCESS_HIT | ACCESS_EVICTION` result. Eviction is only possible after a miss in a full set.
 
-### Trace Processing
+### LRU Strategy
 
-The simulator reads the trace file line by line and applies the lab semantics:
+LRU is implemented with a single monotonic timestamp:
 
 ```c
-if (sscanf(buffer, " %c %llx,%d", &op, &address, &size) != 3) {
-    continue;
-}
-if (op == 'I') {
-    continue;
+cache->timestamp += 1ULL;
+```
+
+On a hit, the matching line receives the current timestamp:
+
+```c
+if (line->tag == tag) {
+    line->last_used = cache->timestamp;
+    cache->hits += 1;
+    return ACCESS_HIT;
 }
 ```
 
-It then handles each operation type:
+On a miss into a full set, the line with the smallest `last_used` value is evicted.
+
+This strategy is simple and appropriate here:
+
+- no linked lists
+- no line reordering
+- no aging pass
+- access time remains `O(E)`
+- replacement behavior is easy to audit
+
+### Core Access Algorithm
+
+`access_cache` performs one pass over the target set:
+
+```mermaid
+flowchart TD
+    Start["access_cache(address)"] --> Decode["Compute set index and tag"]
+    Decode --> Scan["Scan lines in target set"]
+    Scan --> Hit{"Valid line with matching tag?"}
+    Hit -->|yes| CountHit["Update last_used and hits"]
+    CountHit --> ReturnHit["Return ACCESS_HIT"]
+    Hit -->|no| Empty{"Any invalid line?"}
+    Empty -->|yes| Fill["Fill first invalid line"]
+    Fill --> ReturnMiss["Return ACCESS_MISS"]
+    Empty -->|no| Evict["Replace least recently used line"]
+    Evict --> ReturnEvict["Return ACCESS_MISS | ACCESS_EVICTION"]
+```
 
 ```c
-if (op == 'L' || op == 'S') {
-    int result = access_cache(&cache, address);
-    if (verbose) {
-        print_result_tokens(result);
-        printf("\n");
+static int access_cache(Cache *cache, unsigned long long address)
+{
+    unsigned long long set_index;
+    unsigned long long tag;
+    CacheSet *set;
+    CacheLine *empty_line;
+    CacheLine *lru_line;
+    int line_index;
+
+    cache->timestamp += 1ULL;
+    set_index = (address >> cache->b) & cache->set_mask;
+    tag = address >> (cache->s + cache->b);
+    set = &cache->sets[set_index];
+    empty_line = NULL;
+    lru_line = NULL;
+```
+
+During the scan, the function tracks three possibilities:
+
+```c
+    for (line_index = 0; line_index < cache->E; ++line_index) {
+        CacheLine *line = &set->lines[line_index];
+
+        if (line->valid) {
+            if (line->tag == tag) {
+                line->last_used = cache->timestamp;
+                cache->hits += 1;
+                return ACCESS_HIT;
+            }
+            if (lru_line == NULL || line->last_used < lru_line->last_used) {
+                lru_line = line;
+            }
+        } else if (empty_line == NULL) {
+            empty_line = line;
+        }
     }
-} else if (op == 'M') {
-    int first = access_cache(&cache, address);
-    int second = access_cache(&cache, address);
-    if (verbose) {
-        print_result_tokens(first);
-        print_result_tokens(second);
-        printf("\n");
-    }
-}
 ```
 
-This is an exact implementation of the lab rules:
-
-- `I` is ignored
-- `L` and `S` perform one access
-- `M` performs two accesses
-
-For a modify operation, the second access is guaranteed to hit because the first access either found the block or loaded it:
-
-```c
-/* Trace line: M 20,1 */
-first  = access_cache(&cache, 0x20ULL);  /* hit OR miss OR miss eviction */
-second = access_cache(&cache, 0x20ULL);  /* hit, because the block is now resident */
-```
-
-That is why the reference-style verbose output for a cold modify usually looks like:
+The three tracked outcomes are:
 
 ```text
-M 20,1 miss hit
+tag match      -> hit, return immediately
+invalid line   -> remember first empty line
+valid nonmatch -> update least-recently-used candidate
 ```
 
-### Verbose Mode
+If the scan finishes without a hit, the access is a miss:
 
-The simulator prints verbose result tokens using:
+```c
+    cache->misses += 1;
+    if (empty_line != NULL) {
+        empty_line->valid = 1;
+        empty_line->tag = tag;
+        empty_line->last_used = cache->timestamp;
+        return ACCESS_MISS;
+    }
+
+    lru_line->tag = tag;
+    lru_line->last_used = cache->timestamp;
+    cache->evictions += 1;
+    return ACCESS_MISS | ACCESS_EVICTION;
+}
+```
+
+The miss behavior is:
+
+1. Fill the first empty line if one exists.
+2. Otherwise overwrite the least recently used line.
+3. Count an eviction only in the overwrite case.
+
+That gives the key counter invariant:
+
+```text
+hits + misses == number of data accesses simulated
+evictions <= misses
+```
+
+### Trace Parsing
+
+The trace loop reads line by line:
+
+```c
+while (fgets(buffer, (int)sizeof(buffer), trace_file) != NULL) {
+    char op;
+    unsigned long long address;
+    int size;
+
+    if (sscanf(buffer, " %c %llx,%d", &op, &address, &size) != 3) {
+        continue;
+    }
+    if (op == 'I') {
+        continue;
+    }
+```
+
+The leading space in the format string allows either leading-space Valgrind lines or no-leading-space lines:
+
+```c
+" %c %llx,%d"
+```
+
+For verbose mode, the original operation is printed before the result tokens:
+
+```c
+    if (verbose) {
+        printf("%c %llx,%d", op, address, size);
+    }
+```
+
+Then the operation dispatch applies the Cache Lab semantics:
+
+```c
+    if (op == 'L' || op == 'S') {
+        int result = access_cache(&cache, address);
+        if (verbose) {
+            print_result_tokens(result);
+            printf("\n");
+        }
+    } else if (op == 'M') {
+        int first = access_cache(&cache, address);
+        int second = access_cache(&cache, address);
+        if (verbose) {
+            print_result_tokens(first);
+            print_result_tokens(second);
+            printf("\n");
+        }
+    }
+}
+```
+
+For `M`, the second access should always hit because the first access either already hit or loaded the block:
+
+```text
+M address,size
+    first access:  hit OR miss OR miss eviction
+    second access: hit
+```
+
+### Verbose Output Formatting
+
+The verbose printer orders tokens to match the expected reference style:
 
 ```c
 static void print_result_tokens(int result)
@@ -491,24 +694,72 @@ static void print_result_tokens(int result)
 }
 ```
 
-That ordering matters. For example:
+A cold modify that does not evict prints:
 
-- a simple hit becomes `hit`
-- a miss with eviction becomes `miss eviction`
-- an `M` that misses first and then hits becomes `miss hit`
-
-### Cleanup and Final Reporting
-
-The code frees all allocated memory and calls `printSummary` exactly once at the end of `main`:
-
-```c
-fclose(trace_file);
-printSummary(cache.hits, cache.misses, cache.evictions);
-free_cache(&cache);
-return 0;
+```text
+M 20,1 miss hit
 ```
 
-The file-open failure path also frees the cache before exiting:
+A modify that misses, evicts, then hits prints:
+
+```text
+M 12,1 miss eviction hit
+```
+
+### Example Trace Walkthrough
+
+[traces/yi.trace](../traces/yi.trace) contains:
+
+```text
+ L 10,1
+ M 20,1
+ L 22,1
+ S 18,1
+ L 110,1
+ L 210,1
+ M 12,1
+```
+
+With `s = 4`, `E = 1`, `b = 4`, the current simulator prints:
+
+```text
+L 10,1 miss
+M 20,1 miss hit
+L 22,1 hit
+S 18,1 hit
+L 110,1 miss eviction
+L 210,1 miss eviction
+M 12,1 miss eviction hit
+hits:4 misses:5 evictions:3
+```
+
+The final summary comes from `printSummary`:
+
+```c
+void printSummary(int hits, int misses, int evictions)
+{
+    printf("hits:%d misses:%d evictions:%d\n", hits, misses, evictions);
+    FILE* output_fp = fopen(".csim_results", "w");
+    assert(output_fp);
+    fprintf(output_fp, "%d %d %d\n", hits, misses, evictions);
+    fclose(output_fp);
+}
+```
+
+That helper both prints to stdout and writes `.csim_results`, which the grading tools consume.
+
+### Error Handling And Cleanup
+
+The simulator handles allocation failure:
+
+```c
+if (!init_cache(&cache, s, E, b)) {
+    fprintf(stderr, "Failed to allocate cache\n");
+    return 1;
+}
+```
+
+It also handles trace-open failure and releases already allocated cache memory:
 
 ```c
 trace_file = fopen(trace_path, "r");
@@ -519,177 +770,213 @@ if (trace_file == NULL) {
 }
 ```
 
-### Complexity
+The success path closes the file, reports results, and frees the cache:
 
-For `S = 2^s` sets and `E` lines per set:
+```c
+fclose(trace_file);
+printSummary(cache.hits, cache.misses, cache.evictions);
+free_cache(&cache);
+return 0;
+```
 
-- memory: `O(S * E)`
-- access time per memory operation: `O(E)`
+### Simulator Complexity
 
-That is the expected complexity for a straightforward explicit cache simulator.
+Let:
 
-### Result
+```text
+S = 2^s sets
+E = lines per set
+T = number of data accesses in the trace after ignoring I operations
+```
 
-Official Linux result:
+Then:
 
-- `test-csim = 27/27`
+```text
+memory complexity:        O(S * E)
+time per access:          O(E)
+total trace processing:   O(T * E)
+```
 
-This is a perfect correctness score and means the simulator matched the reference results across the provided evaluation traces.
+This is expected for a direct explicit set-associative simulator. Because Cache Lab traces use small `E`, the one-pass set scan is simpler than a more complex replacement data structure.
 
-## Part B: Cache-Aware Matrix Transpose
+### Simulator Design Review
+
+The simulator is intentionally compact, but it has the important robustness properties:
+
+- 64-bit addresses are parsed with `%llx`.
+- shift widths are validated before cache initialization.
+- invalid numeric arguments are rejected instead of silently accepted.
+- partial allocation failure is cleaned up.
+- LRU behavior is deterministic.
+- `M` operations are implemented as two ordinary accesses.
+- verbose mode prints result tokens in reference-compatible order.
+
+The main limitation is that unknown non-`I`, non-`L`, non-`S`, non-`M` parsed operations are silently ignored after optional operation printing has already occurred. The provided traces do not contain such operations, so this does not affect the grading workload.
+
+## Part B: Matrix Transpose Design
 
 File: [trans.c](../trans.c)
 
-### Design Constraints Reflected in the Code
-
-The current implementation respects the project constraints in a concrete way:
-
-- no recursion
-- no `malloc`
-- no local arrays in the transpose logic
-- scalar temporaries only
-- minimal `transpose_submit` dispatch logic
-
-The dispatch function is intentionally small:
+The transpose function must implement:
 
 ```c
-void transpose_submit(int M, int N, int A[N][M], int B[M][N])
+void trans(int M, int N, int A[N][M], int B[M][N]);
+```
+
+The required result is:
+
+```text
+B[col][row] == A[row][col]
+```
+
+The implementation is evaluated on a direct-mapped `1KB` cache with `32-byte` blocks. The code is written to respect typical Cache Lab constraints:
+
+- no heap allocation in the transpose functions
+- no recursion
+- no local arrays inside the optimized transpose path
+- scalar temporaries only
+- straightforward control flow that the trace generator can measure cleanly
+
+### Function Map
+
+| Function | Role |
+| --- | --- |
+| `transpose_submit` | Graded entry point, dispatches by matrix dimensions |
+| `transpose_32` | Specialized `32x32` implementation using `8x8` tiles |
+| `transpose_64` | Specialized `64x64` implementation using staged `8x8` tiles split into `4x4` quadrants |
+| `transpose_generic` | Bounded `16x16` blocked traversal for all other dimensions |
+| `trans` | Simple baseline implementation registered for comparison |
+| `registerFunctions` | Registers both the optimized and baseline functions with the test harness |
+| `is_transpose` | Correctness checker helper |
+
+The registration function is:
+
+```c
+void registerFunctions()
 {
-    if (M == 32 && N == 32) {
-        transpose_32(M, N, A, B);
-    } else if (M == 64 && N == 64) {
-        transpose_64(M, N, A, B);
-    } else {
-        transpose_generic(M, N, A, B);
-    }
+    registerTransFunction(transpose_submit, transpose_submit_desc);
+    registerTransFunction(trans, trans_desc);
 }
 ```
 
-One important detail: the code does not have a dedicated `transpose_61x67` helper by name. Instead, the generic helper is used for all sizes other than `32x32` and `64x64`. In graded use, that means it handles `61x67`.
+The grading harness identifies the official solution by description string:
 
-### Transpose Function Map
+```c
+#define SUBMIT_DESCRIPTION "Transpose submission"
+```
 
-| Function | Input shape | Strategy | Why this helper exists |
-| --- | --- | --- | --- |
-| `transpose_submit` | Any `M x N` accepted by the driver | Dispatch by known graded dimensions | Keeps the graded entry point small and auditable |
-| `transpose_32` | `32x32` | `8x8` blocking with scalar staging | Matches the `8 ints per cache line` geometry cleanly |
-| `transpose_64` | `64x64` | `8x8` tiles split into `4x4` quadrants | Avoids direct-mapped conflict misses that simple blocking triggers |
-| `transpose_generic` | Everything else, including `61x67` | `16x16` blocked traversal with clipped edges | Handles irregular dimensions without special-case code |
-| `trans` | Any shape | Simple row-wise baseline | Registered for comparison, not used as the optimized submission |
+That is why [trans.c](../trans.c) preserves:
+
+```c
+char transpose_submit_desc[] = "Transpose submission";
+```
 
 ### Row-Major Address Math
 
-The transpose code depends on C's row-major layout. For `A[N][M]` and `B[M][N]`, the addresses are:
+C stores `int A[N][M]` in row-major order. The element address formulas are:
 
 ```c
-address_of_A_r_c = base_A + sizeof(int) * (r * M + c);
-address_of_B_c_r = base_B + sizeof(int) * (c * N + r);
+address(A[r][c]) = base_A + sizeof(int) * (r * M + c);
+address(B[c][r]) = base_B + sizeof(int) * (c * N + r);
 ```
 
-Under the grading cache geometry, the set index for either matrix element is:
+For the transpose grading cache:
 
 ```c
-set_index = (address >> 5) & 31;  /* b = 5, s = 5 */
+set_index = (address >> 5) & 31;
 ```
 
-This explains the asymmetry in the transpose loops:
+Contiguous source-row reads are cache friendly:
 
 ```c
-/* Good source locality: contiguous row elements. */
-A[k][j + 0], A[k][j + 1], A[k][j + 2], A[k][j + 3]
-
-/* Harder destination locality: transposed writes step through B rows. */
-B[j + 0][k], B[j + 1][k], B[j + 2][k], B[j + 3][k]
+A[k][j + 0];
+A[k][j + 1];
+A[k][j + 2];
+A[k][j + 3];
+A[k][j + 4];
+A[k][j + 5];
+A[k][j + 6];
+A[k][j + 7];
 ```
 
-The helpers optimize around that mismatch: reads from `A` are naturally row-friendly, while writes to `B` need careful ordering to avoid repeated set conflicts.
+Those eight `int` values occupy exactly one `32-byte` cache block.
 
-## `32x32` Implementation
-
-### Exact Strategy in the Current Code
-
-The `32x32` helper uses `8x8` tiling and scalar register staging:
+The corresponding writes are transposed:
 
 ```c
-for (i = 0; i < N; i += 8) {
-    for (j = 0; j < M; j += 8) {
-        for (k = i; k < i + 8; ++k) {
-            a0 = A[k][j];
-            a1 = A[k][j + 1];
-            a2 = A[k][j + 2];
-            a3 = A[k][j + 3];
-            a4 = A[k][j + 4];
-            a5 = A[k][j + 5];
-            a6 = A[k][j + 6];
-            a7 = A[k][j + 7];
+B[j + 0][k] = a0;
+B[j + 1][k] = a1;
+B[j + 2][k] = a2;
+B[j + 3][k] = a3;
+B[j + 4][k] = a4;
+B[j + 5][k] = a5;
+B[j + 6][k] = a6;
+B[j + 7][k] = a7;
+```
 
-            B[j][k] = a0;
-            B[j + 1][k] = a1;
-            B[j + 2][k] = a2;
-            B[j + 3][k] = a3;
-            B[j + 4][k] = a4;
-            B[j + 5][k] = a5;
-            B[j + 6][k] = a6;
-            B[j + 7][k] = a7;
+Those writes touch different rows of `B`. The transpose implementations are therefore organized around preserving source locality while controlling the order of destination writes.
+
+## `32x32` Transpose
+
+The `32x32` path uses `8x8` blocking:
+
+```c
+static void transpose_32(int M, int N, int A[N][M], int B[M][N])
+{
+    int i, j, k;
+    int a0, a1, a2, a3, a4, a5, a6, a7;
+
+    for (i = 0; i < N; i += 8) {
+        for (j = 0; j < M; j += 8) {
+            for (k = i; k < i + 8; ++k) {
+                a0 = A[k][j];
+                a1 = A[k][j + 1];
+                a2 = A[k][j + 2];
+                a3 = A[k][j + 3];
+                a4 = A[k][j + 4];
+                a5 = A[k][j + 5];
+                a6 = A[k][j + 6];
+                a7 = A[k][j + 7];
+```
+
+The loaded row is written into the transposed destination positions:
+
+```c
+                B[j][k] = a0;
+                B[j + 1][k] = a1;
+                B[j + 2][k] = a2;
+                B[j + 3][k] = a3;
+                B[j + 4][k] = a4;
+                B[j + 5][k] = a5;
+                B[j + 6][k] = a6;
+                B[j + 7][k] = a7;
+            }
         }
     }
 }
 ```
 
-### Tile Sketch
-
-The access pattern for one `8x8` tile is conceptually:
+The tile behavior is:
 
 ```text
-Read one full row segment from A:
-
-A[k][j..j+7] -> a0 a1 a2 a3 a4 a5 a6 a7
-
-Write one full column segment into B:
-
-B[j][k]     = a0
-B[j + 1][k] = a1
-B[j + 2][k] = a2
-B[j + 3][k] = a3
-B[j + 4][k] = a4
-B[j + 5][k] = a5
-B[j + 6][k] = a6
-B[j + 7][k] = a7
+for each 8x8 tile:
+    for each row k in the tile:
+        read A[k][j..j+7] into scalar temporaries
+        write the eight values to B[j..j+7][k]
 ```
 
-So the code is effectively doing:
+The code uses scalar temporaries for a practical reason:
 
 ```text
-8x8 source tile in A
-    row by row load
-        ->
-8x8 destination tile in B
-    column by column fill
+load the complete source cache block first
+then perform destination writes
 ```
 
-### Why This Matches the Cache Geometry
+Without the scalar staging, destination writes could evict source data before all eight values were consumed.
 
-Because each cache block holds `8` integers:
-
-- `A[k][j]` through `A[k][j + 7]` sit in one source block
-- scalar temporaries keep those values out of the way while the code writes to `B`
-- the tile is small enough that locality remains good without extra diagonal handling logic
-
-This implementation does not use a separate diagonal-special-case path. The code relies on simple blocked traversal plus scalar staging.
-
-The correctness invariant for one loaded row is:
+The correctness invariant for each row inside a tile is:
 
 ```c
-/* For one fixed k inside the 8x8 tile. */
-a0 == A[k][j + 0];
-a1 == A[k][j + 1];
-a2 == A[k][j + 2];
-a3 == A[k][j + 3];
-a4 == A[k][j + 4];
-a5 == A[k][j + 5];
-a6 == A[k][j + 6];
-a7 == A[k][j + 7];
-
 B[j + 0][k] == A[k][j + 0];
 B[j + 1][k] == A[k][j + 1];
 B[j + 2][k] == A[k][j + 2];
@@ -700,65 +987,60 @@ B[j + 6][k] == A[k][j + 6];
 B[j + 7][k] == A[k][j + 7];
 ```
 
-Repeating that invariant for `k = i..i+7` completes the full tile.
-
-### Result
-
-- `32x32`: `287` misses
-
-That is well within the full-score threshold defined in [driver.py](../driver.py).
-
-## `64x64` Implementation
-
-### Why This Case Requires a Different Strategy
-
-`64x64` is the difficult case because naive `8x8` blocking interacts poorly with a direct-mapped cache:
-
-- source rows and destination columns repeatedly map to the same sets
-- simple row-wise transpose inside each `8x8` tile causes heavy line thrashing
-
-The current implementation uses a three-phase tile strategy.
-
-### Tile Layout
-
-The best way to read the code is as movement between quadrants of one `8x8` tile:
+Because `32` is divisible by `8`, there is no boundary handling in this helper. The loops cover exactly:
 
 ```text
-Source tile in A
-
-                j..j+3       j+4..j+7
-              +-----------+-----------+
-i..i+3        |    UL     |    UR     |
-              |   4 x 4   |   4 x 4   |
-              +-----------+-----------+
-i+4..i+7      |    LL     |    LR     |
-              |   4 x 4   |   4 x 4   |
-              +-----------+-----------+
+row tiles: 0, 8, 16, 24
+col tiles: 0, 8, 16, 24
 ```
 
-The final destination in `B` should be:
+The recorded result for this implementation is:
 
 ```text
-Destination tile in B, indexed as B[col][row]
-
-                i..i+3       i+4..i+7
-              +-----------+-----------+
-j..j+3        |   UL^T    |   LL^T    |
-              |   4 x 4   |   4 x 4   |
-              +-----------+-----------+
-j+4..j+7      |   UR^T    |   LR^T    |
-              |   4 x 4   |   4 x 4   |
-              +-----------+-----------+
+32x32 transpose: 287 misses
 ```
 
-The implementation does not write that final layout in one straight pass. It gets there through a staging step because that staging step avoids the worst direct-mapped conflicts.
+The driver awards full performance credit at or below `300` misses for this case.
 
-### Phase 1: Process the Upper Four Rows
+## `64x64` Transpose
 
-The helper first reads the top half of an `8x8` tile and writes:
+The `64x64` path is the most important part of [trans.c](../trans.c). A simple `8x8` strategy works well for `32x32`, but it performs poorly on `64x64` because direct-mapped set conflicts become much more frequent.
 
-- the left half to its final destination
-- the right half into staged positions in `B`
+The implementation still uses `8x8` tiles, but it splits each tile into four `4x4` quadrants:
+
+```text
+Source tile A[i..i+7][j..j+7]
+
+              j..j+3       j+4..j+7
+            +-----------+-----------+
+i..i+3      |    UL     |    UR     |
+            |   4 x 4   |   4 x 4   |
+            +-----------+-----------+
+i+4..i+7    |    LL     |    LR     |
+            |   4 x 4   |   4 x 4   |
+            +-----------+-----------+
+```
+
+The final destination tile in `B` must contain:
+
+```text
+Destination tile B[j..j+7][i..i+7]
+
+              i..i+3       i+4..i+7
+            +-----------+-----------+
+j..j+3      |   UL^T    |   LL^T    |
+            |   4 x 4   |   4 x 4   |
+            +-----------+-----------+
+j+4..j+7    |   UR^T    |   LR^T    |
+            |   4 x 4   |   4 x 4   |
+            +-----------+-----------+
+```
+
+The code reaches that final state in three phases.
+
+### Phase 1: Load Upper Rows And Stage Upper-Right Data
+
+The first loop handles the top four source rows:
 
 ```c
 for (k = 0; k < 4; ++k) {
@@ -782,43 +1064,41 @@ for (k = 0; k < 4; ++k) {
 }
 ```
 
-The four staged writes:
-
-- `B[j][i + k + 4]`
-- `B[j + 1][i + k + 4]`
-- `B[j + 2][i + k + 4]`
-- `B[j + 3][i + k + 4]`
-
-are not the final resting place for the upper-right quadrant. They are temporary staging locations used to avoid the worst conflict pattern.
-
-After phase 1, the relevant region of `B` looks like this:
-
-```text
-Intermediate B state after phase 1
-
-                i..i+3         i+4..i+7
-              +-------------+-------------+
-j..j+3        |    UL^T     |  UR^T temp  |
-              |    final    |   staged    |
-              +-------------+-------------+
-j+4..j+7      |   unused    |   unused    |
-              |             |             |
-              +-------------+-------------+
-```
-
-That is why phase 1 looks slightly odd in code: it is intentionally writing the upper-right values into a temporary holding area inside the upper-right quadrant of the destination tile.
-
-The postcondition after phase 1 is:
+The first four writes are final:
 
 ```c
-/* For k = 0..3 and q = 0..3. */
-B[j + q][i + k]     == A[i + k][j + q];       /* UL^T final */
-B[j + q][i + k + 4] == A[i + k][j + q + 4];   /* UR^T staged */
+B[j + 0][i + k] = A[i + k][j + 0];
+B[j + 1][i + k] = A[i + k][j + 1];
+B[j + 2][i + k] = A[i + k][j + 2];
+B[j + 3][i + k] = A[i + k][j + 3];
 ```
 
-### Phase 2: Swap the Staged Values with the Lower-Left Quadrant
+The last four writes are staging writes:
 
-The second phase reads the staged values back out of `B`, reads the lower-left values from `A`, and swaps them into their final positions:
+```c
+B[j + 0][i + k + 4] = A[i + k][j + 4];
+B[j + 1][i + k + 4] = A[i + k][j + 5];
+B[j + 2][i + k + 4] = A[i + k][j + 6];
+B[j + 3][i + k + 4] = A[i + k][j + 7];
+```
+
+After phase 1, the tile in `B` looks like:
+
+```text
+              i..i+3       i+4..i+7
+            +-----------+-----------+
+j..j+3      |   UL^T    | UR^T temp |
+            |   final   |  staged   |
+            +-----------+-----------+
+j+4..j+7    |  unused   |  unused   |
+            +-----------+-----------+
+```
+
+The staging area is deliberate. It holds `UR^T` in rows `j..j+3` until the lower-left source values can be loaded and written efficiently.
+
+### Phase 2: Swap Staged Upper-Right With Lower-Left
+
+The second loop processes one left-column slice of the bottom half at a time:
 
 ```c
 for (k = 0; k < 4; ++k) {
@@ -831,12 +1111,22 @@ for (k = 0; k < 4; ++k) {
     a5 = A[i + 5][j + k];
     a6 = A[i + 6][j + k];
     a7 = A[i + 7][j + k];
+```
 
+The first four loads recover the staged `UR^T` values from `B`. The next four loads read the `LL` values from `A`.
+
+Then the code writes `LL^T` into the upper-right destination quadrant:
+
+```c
     B[j + k][i + 4] = a4;
     B[j + k][i + 5] = a5;
     B[j + k][i + 6] = a6;
     B[j + k][i + 7] = a7;
+```
 
+Finally it moves the staged `UR^T` values into the lower-left destination quadrant:
+
+```c
     B[j + 4 + k][i] = a0;
     B[j + 4 + k][i + 1] = a1;
     B[j + 4 + k][i + 2] = a2;
@@ -844,47 +1134,32 @@ for (k = 0; k < 4; ++k) {
 }
 ```
 
-Conceptually, phase 2 performs this exchange:
+After phase 2:
 
 ```text
-before phase 2:
-    B[j..j+3][i+4..i+7] contains staged UR^T
-
-phase 2 writes:
-    LL^T -> B[j..j+3][i+4..i+7]
-    UR^T -> B[j+4..j+7][i..i+3]
+              i..i+3       i+4..i+7
+            +-----------+-----------+
+j..j+3      |   UL^T    |   LL^T    |
+            |   final   |   final   |
+            +-----------+-----------+
+j+4..j+7    |   UR^T    |  pending  |
+            |   final   |           |
+            +-----------+-----------+
 ```
 
-So the tile transitions like this:
-
-```text
-Intermediate B state after phase 2
-
-                i..i+3         i+4..i+7
-              +-------------+-------------+
-j..j+3        |    UL^T     |    LL^T     |
-              |    final    |    final    |
-              +-------------+-------------+
-j+4..j+7      |    UR^T     |   pending   |
-              |    final    |             |
-              +-------------+-------------+
-```
-
-This is the key step in the implementation. The code uses `B` as a controlled staging area so that upper-right and lower-left data can be reordered without forcing the worst-case direct-mapped collisions at the wrong time.
-
-The code-level postcondition after phase 2 is:
+The postconditions are:
 
 ```c
 /* For k = 0..3 and q = 0..3. */
-B[j + k][i + 4 + q] == A[i + 4 + q][j + k];   /* LL^T final */
-B[j + 4 + k][i + q] == A[i + q][j + 4 + k];   /* UR^T final */
+B[j + k][i + 4 + q] == A[i + 4 + q][j + k];
+B[j + 4 + k][i + q] == A[i + q][j + 4 + k];
 ```
 
-Combined with phase 1, that means three quadrants are now complete: `UL^T`, `LL^T`, and `UR^T`.
+This is the central optimization. `B` is used as a temporary staging area so that the source tile can be consumed in an order that avoids the worst direct-mapped conflict pattern.
 
-### Phase 3: Write the Lower-Right Quadrant
+### Phase 3: Write Lower-Right Directly
 
-After the swap, the bottom-right `4x4` quadrant can be written directly:
+The last loop handles the lower-right quadrant:
 
 ```c
 for (k = 0; k < 4; ++k) {
@@ -900,145 +1175,146 @@ for (k = 0; k < 4; ++k) {
 }
 ```
 
-After phase 3, the tile is complete:
+After this, all four destination quadrants are final:
 
 ```text
-Final B tile
-
-                i..i+3         i+4..i+7
-              +-------------+-------------+
-j..j+3        |    UL^T     |    LL^T     |
-              |    final    |    final    |
-              +-------------+-------------+
-j+4..j+7      |    UR^T     |    LR^T     |
-              |    final    |    final    |
-              +-------------+-------------+
+              i..i+3       i+4..i+7
+            +-----------+-----------+
+j..j+3      |   UL^T    |   LL^T    |
+            |   final   |   final   |
+            +-----------+-----------+
+j+4..j+7    |   UR^T    |   LR^T    |
+            |   final   |   final   |
+            +-----------+-----------+
 ```
 
-The final quadrant invariant is:
+The final postcondition is:
 
 ```c
-/* For k = 0..3 and q = 0..3. */
-B[j + 4 + q][i + 4 + k] == A[i + 4 + k][j + 4 + q];   /* LR^T final */
+/* For q = 0..3 and k = 0..3. */
+B[j + 4 + q][i + 4 + k] == A[i + 4 + k][j + 4 + q];
 ```
 
-### Why This Works
+### `64x64` Algorithm Summary
 
-This is not just "blocking." It is conflict-aware reordering.
+One `8x8` tile is processed as:
 
-The important idea is:
-
-- read one half of the tile
-- stage part of it in `B`
-- move the staged values later, after the lower-left source data has been handled
-
-An ASCII summary of the data movement is:
+```mermaid
+flowchart TD
+    Tile["One 8x8 tile"] --> P1["Phase 1: load upper rows"]
+    P1 --> UL["Write UL^T to final B positions"]
+    P1 --> Stage["Stage UR^T in upper-right B area"]
+    Stage --> P2["Phase 2: process lower-left values"]
+    UL --> P2
+    P2 --> LL["Write LL^T over staging area"]
+    P2 --> MoveUR["Move staged UR^T to final lower-left B area"]
+    LL --> P3["Phase 3: load lower-right rows"]
+    MoveUR --> P3
+    P3 --> LR["Write LR^T to final B positions"]
+    LR --> Done["Complete transposed 8x8 tile"]
+```
 
 ```text
-UL -> final upper-left
-UR -> temporary upper-right staging area
-LL -> final upper-right, replacing staged UR
-UR -> final lower-left after being pulled back out of staging
-LR -> final lower-right
+phase 1:
+    read top four rows of A
+    write UL^T to final B positions
+    stage UR^T in the upper-right area of B
+
+phase 2:
+    read staged UR^T back from B
+    read LL from A
+    write LL^T to final upper-right positions
+    move staged UR^T to final lower-left positions
+
+phase 3:
+    read LR from A
+    write LR^T to final lower-right positions
 ```
 
-That is what allows the implementation to avoid the large miss penalties that simpler `64x64` transposes incur on a direct-mapped cache.
-
-As compact pseudocode, one `8x8` tile behaves like this:
+As compact pseudocode:
 
 ```text
-/* Phase 1: top rows. */
-for k in 0..3:
-    load A[i + k][j..j + 7]
-    write UL to B[j..j + 3][i + k]
-    stage UR in B[j..j + 3][i + k + 4]
+for each 8x8 tile (i, j):
+    for k in 0..3:
+        load A top row: UL values and UR values
+        write UL to final B
+        stage UR in B
 
-/* Phase 2: left columns of bottom rows. */
-for k in 0..3:
-    read staged UR column from B[j + k][i + 4..i + 7]
-    load LL column from A[i + 4..i + 7][j + k]
-    write LL to B[j + k][i + 4..i + 7]
-    move staged UR to B[j + 4 + k][i..i + 3]
+    for k in 0..3:
+        load staged UR from B
+        load LL column from A
+        write LL to final B
+        move UR to final B
 
-/* Phase 3: bottom-right rows. */
-for k in 0..3:
-    load LR row from A[i + 4 + k][j + 4..j + 7]
-    write LR to B[j + 4..j + 7][i + 4 + k]
+    for k in 0..3:
+        load LR row from A
+        write LR to final B
 ```
 
-### Result
+The recorded result for this implementation is:
 
-- `64x64`: `1227` misses
+```text
+64x64 transpose: 1227 misses
+```
 
-This is the strongest result in the project because `64x64` is the case that most clearly distinguishes truly cache-aware logic from ordinary blocked transpose code.
+The driver awards full performance credit at or below `1300` misses. This is the strongest evidence that the code is doing more than ordinary blocking.
 
-## Generic Helper for `61x67` and Other Sizes
+## Generic Transpose For Irregular Sizes
 
-### Exact Strategy in the Current Code
-
-The generic helper uses `16x16` tiles with boundary checks:
+The generic helper handles all non-`32x32`, non-`64x64` inputs:
 
 ```c
-for (i = 0; i < N; i += 16) {
-    for (j = 0; j < M; j += 16) {
-        for (k = i; k < N && k < i + 16; ++k) {
-            for (l = j; l < M && l < j + 16; ++l) {
-                B[l][k] = A[k][l];
+static void transpose_generic(int M, int N, int A[N][M], int B[M][N])
+{
+    int i, j, k, l;
+
+    for (i = 0; i < N; i += 16) {
+        for (j = 0; j < M; j += 16) {
+            for (k = i; k < N && k < i + 16; ++k) {
+                for (l = j; l < M && l < j + 16; ++l) {
+                    B[l][k] = A[k][l];
+                }
             }
         }
     }
 }
 ```
 
-This helper is used for:
-
-- `61x67` in the graded workload
-- any non-`32x32` and non-`64x64` dimensions if the function is called with other sizes
-
-### Why the Generic Helper Is Reasonable
-
-For irregular dimensions, the main concerns are:
-
-- preserving locality through blocking
-- handling boundaries cleanly
-- not overcomplicating the implementation with special-case logic that offers little benefit
-
-The `16x16` tile size is a practical compromise:
-
-- large enough to exploit locality
-- small enough that edge handling remains straightforward
-
-For the graded irregular input, the traversal looks like this conceptually:
+For the graded irregular case, `M = 61` and `N = 67`, so the loops cover:
 
 ```text
-61x67 matrix
-
-rows:
-0..15   16..31   32..47   48..63   64..66
-
-cols:
-0..15   16..31   32..47   48..60
+row starts: 0, 16, 32, 48, 64
+col starts: 0, 16, 32, 48
 ```
 
-So the last tiles are clipped naturally by:
+The boundary conditions clip partial tiles:
 
 ```c
-for (k = i; k < N && k < i + 16; ++k) {
-    for (l = j; l < M && l < j + 16; ++l) {
-        B[l][k] = A[k][l];
-    }
-}
+k < N && k < i + 16
+l < M && l < j + 16
 ```
 
-That boundary logic is the whole reason the generic helper remains robust without requiring a separate irregular-case implementation.
+For the last row tile:
 
-The same logic can be read as an explicit clipped-tile contract:
+```text
+i = 64
+k = 64, 65, 66
+```
+
+For the last column tile:
+
+```text
+j = 48
+l = 48..60
+```
+
+The helper never reads or writes outside the valid matrix bounds. Its implicit tile contract is:
 
 ```c
 row_start = i;
-row_end = (i + 16 < N) ? i + 16 : N;
+row_end = min(i + 16, N);
 col_start = j;
-col_end = (j + 16 < M) ? j + 16 : M;
+col_end = min(j + 16, M);
 
 for (k = row_start; k < row_end; ++k) {
     for (l = col_start; l < col_end; ++l) {
@@ -1047,17 +1323,228 @@ for (k = row_start; k < row_end; ++k) {
 }
 ```
 
-For the last `61x67` row tile, that means `row_start = 64` and `row_end = 67`, so only rows `64`, `65`, and `66` are touched. For the last column tile, `col_start = 48` and `col_end = 61`, so only columns `48..60` are touched. No out-of-bounds access is possible as long as the loop guards stay in that form.
+The generic path is intentionally less intricate than the `64x64` path. Irregular dimensions are harder to choreograph perfectly, and the full-credit threshold is looser. A clean clipped-block traversal gives strong locality without adding fragile dimension-specific code.
 
-### Result
+The recorded result for this implementation is:
 
-- `61x67`: `1992` misses
+```text
+61x67 transpose: 1992 misses
+```
 
-That is inside the full-score threshold in the current driver.
+The driver awards full performance credit at or below `2000` misses.
 
-## Exact Scoring Thresholds in This Repository
+## Baseline Transpose And Correctness Helper
 
-The performance thresholds are not just folklore. The current [driver.py](../driver.py) uses:
+[trans.c](../trans.c) keeps a simple transpose implementation for comparison:
+
+```c
+char trans_desc[] = "Simple row-wise scan transpose";
+void trans(int M, int N, int A[N][M], int B[M][N])
+{
+    int i, j, tmp;
+
+    for (i = 0; i < N; i++) {
+        for (j = 0; j < M; j++) {
+            tmp = A[i][j];
+            B[j][i] = tmp;
+        }
+    }
+}
+```
+
+This baseline is correct but not optimized. It exists so the test harness can report multiple registered functions.
+
+The local correctness helper checks the transpose relation directly:
+
+```c
+int is_transpose(int M, int N, int A[N][M], int B[M][N])
+{
+    int i, j;
+
+    for (i = 0; i < N; i++) {
+        for (j = 0; j < M; ++j) {
+            if (A[i][j] != B[j][i]) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+```
+
+The test harness uses its own validation path in [tracegen.c](../tracegen.c), but this helper documents the exact correctness property the optimized code must satisfy.
+
+## Evaluation Harness Design
+
+The Part B evaluation path is worth understanding because it explains why [trans.c](../trans.c) is written with explicit memory operations.
+
+### Function Registration
+
+[cachelab.h](../cachelab.h) defines the registration type:
+
+```c
+typedef struct trans_func{
+  void (*func_ptr)(int M,int N,int[N][M],int[M][N]);
+  char* description;
+  char correct;
+  unsigned int num_hits;
+  unsigned int num_misses;
+  unsigned int num_evictions;
+} trans_func_t;
+```
+
+[cachelab.c](../cachelab.c) stores registered functions in a global array:
+
+```c
+trans_func_t func_list[MAX_TRANS_FUNCS];
+int func_counter = 0;
+```
+
+Registration appends to that array:
+
+```c
+void registerTransFunction(void (*trans)(int M, int N, int[N][M], int[M][N]),
+                           char* desc)
+{
+    func_list[func_counter].func_ptr = trans;
+    func_list[func_counter].description = desc;
+    func_list[func_counter].correct = 0;
+    func_list[func_counter].num_hits = 0;
+    func_list[func_counter].num_misses = 0;
+    func_list[func_counter].num_evictions =0;
+    func_counter++;
+}
+```
+
+### Trace Generation
+
+[tracegen.c](../tracegen.c) creates static matrices:
+
+```c
+static int A[256][256];
+static int B[256][256];
+static int M;
+static int N;
+```
+
+It records marker addresses:
+
+```c
+volatile char MARKER_START, MARKER_END;
+```
+
+Before and after each transpose call, it touches those markers:
+
+```c
+MARKER_START = 33;
+(*func_list[selectedFunc].func_ptr)(M, N, A, B);
+MARKER_END = 34;
+```
+
+[test-trans.c](../test-trans.c) uses those marker addresses to isolate the trace region for the transpose function.
+
+### Correctness Validation
+
+The harness builds a known-correct result:
+
+```c
+int C[M][N];
+memset(C,0,sizeof(C));
+correctTrans(M,N,A,C);
+```
+
+Then it compares the candidate output:
+
+```c
+for(int i=0;i<M;i++) {
+    for(int j=0;j<N;j++) {
+        if(B[i][j]!=C[i][j]) {
+            printf("Validation failed on function %d! Expected %d but got %d at B[%d][%d]\n",fn,C[i][j],B[i][j],i,j);
+            return 0;
+        }
+    }
+}
+return 1;
+```
+
+This means performance is only meaningful if correctness passes first.
+
+### Trace Filtering
+
+[test-trans.c](../test-trans.c) runs Valgrind Lackey:
+
+```c
+sprintf(cmd, "valgrind --tool=lackey --trace-mem=yes --log-fd=1 -v ./tracegen -M %d -N %d -F %d  > trace.tmp", M, N,i);
+```
+
+Then it filters trace lines between marker accesses:
+
+```c
+if (addr == marker_start)
+    flag = 1;
+
+if (flag && addr < 0xffffffff) {
+    fputs(buf, part_trace_fp);
+}
+
+if (addr == marker_end) {
+    flag = 0;
+    fclose(part_trace_fp);
+    break;
+}
+```
+
+The `addr < 0xffffffff` filter is the assignment's simple way to ignore many stack references emitted by Valgrind.
+
+### Performance Measurement
+
+The harness evaluates the filtered trace with the reference simulator:
+
+```c
+sprintf(cmd, "./csim-ref -s %u -E %u -b %u -t trace.f%d > /dev/null",
+        s, E, b, i);
+system(cmd);
+```
+
+Then it reads `.csim_results`:
+
+```c
+FILE* in_fp = fopen(".csim_results","r");
+assert(in_fp);
+fscanf(in_fp, "%u %u %u", &hits, &misses, &evictions);
+fclose(in_fp);
+```
+
+This is why the transpose code is judged by memory-reference behavior rather than wall-clock time.
+
+## Scoring Model
+
+[driver.py](../driver.py) defines the maximum points:
+
+```python
+maxscore= {};
+maxscore['csim'] = 27
+maxscore['transc'] = 1
+maxscore['trans32'] = 8
+maxscore['trans64'] = 8
+maxscore['trans61'] = 10
+```
+
+Miss scores are computed by linear interpolation:
+
+```python
+def computeMissScore(miss, lower, upper, full_score):
+    if miss <= lower:
+        return full_score
+    if miss >= upper:
+        return 0
+
+    score = (miss - lower) * 1.0
+    range = (upper- lower) * 1.0
+    return round((1 - score / range) * full_score, 1)
+```
+
+The thresholds are:
 
 ```python
 trans32_score = computeMissScore(miss32, 300, 600, maxscore['trans32']) * int(result32[0])
@@ -1065,87 +1552,283 @@ trans64_score = computeMissScore(miss64, 1300, 2000, maxscore['trans64']) * int(
 trans61_score = computeMissScore(miss61, 2000, 3000, maxscore['trans61']) * int(result61[0])
 ```
 
-That means the full-score lower thresholds in this repository are:
+So the full-score miss ceilings are:
 
-- `32x32`: `300`
-- `64x64`: `1300`
-- `61x67`: `2000`
+| Workload | Full score at or below | Zero score at or above |
+| --- | ---: | ---: |
+| `32x32` | `300` misses | `600` misses |
+| `64x64` | `1300` misses | `2000` misses |
+| `61x67` | `2000` misses | `3000` misses |
 
-The current results compare as follows:
+The recorded project results are:
 
-| Case | Current Result | Full-Score Threshold | Outcome |
-| --- | ---: | ---: | --- |
-| Cache simulator | `27/27` | `27/27` | perfect correctness |
-| `32x32` | `287` misses | `300` | full-score range |
-| `64x64` | `1227` misses | `1300` | full-score range |
-| `61x67` | `1992` misses | `2000` | full-score range |
+| Component | Result | Interpretation |
+| --- | ---: | --- |
+| Cache simulator | `27/27` | Perfect Part A correctness under the official checker |
+| `32x32` transpose | `287` misses | Full-score range |
+| `64x64` transpose | `1227` misses | Full-score range |
+| `61x67` transpose | `1992` misses | Full-score range |
 
-## What the Results Demonstrate
+The `64x64` result is the most technically meaningful performance result because it requires avoiding direct-mapped conflict behavior that ordinary `8x8` blocking does not handle well.
 
-From a systems perspective, these results show:
+## Correctness Contracts
 
-- the simulator is correct, not merely plausible
-- the transpose implementation uses cache-aware blocking rather than brute-force copying
-- the `64x64` path specifically handles direct-mapped conflict behavior in a nontrivial way
-- the implementation choices are backed by measured outcomes on the actual driver
+### Simulator Contracts
 
-The `64x64` result is the most meaningful performance signal because that case punishes simplistic blocked implementations.
+For every data access:
 
-## Design Tradeoffs and Deliberate Simplifications
+```text
+exactly one of these happens:
+    hit
+    miss without eviction
+    miss with eviction
+```
 
-### Why timestamps for LRU?
+Counter updates must satisfy:
 
-- simpler than linked structures
-- easy to inspect and reason about
-- naturally supports one-pass set scanning
+```text
+hit:
+    hits += 1
 
-### Why not allocate block contents in the simulator?
+miss without eviction:
+    misses += 1
 
-- the lab does not require block payload simulation
-- hits, misses, and evictions depend only on metadata
-- omitting payload storage reduces code and memory footprint
+miss with eviction:
+    misses += 1
+    evictions += 1
+```
 
-### Why specialize the transpose by size?
+For every `M` operation:
 
-- `32x32` is solved well by direct `8x8` blocking
-- `64x64` requires conflict-aware staging and reordering
-- `61x67` benefits more from clean blocked traversal than from intricate tile choreography
+```text
+first access:
+    normal cache access
 
-The current code specializes where specialization pays off and stays simple where it does not.
+second access:
+    same address
+    must hit after first access completes
+```
 
-### Why no special diagonal path in `32x32`?
+For valid lines:
 
-Because the current implementation already achieves `287` misses, which is in the full-score range. Additional diagonal-specific logic would increase complexity without being necessary for the observed result.
+```text
+line.valid == 1
+line.tag == address tag for resident block
+line.last_used == timestamp of most recent access to that line
+```
 
-### Why keep the `64x64` logic imperative rather than abstract?
+For invalid lines:
 
-The `64x64` helper is easier to verify in its current style because:
+```text
+line.valid == 0
+line.tag and line.last_used do not affect behavior
+```
 
-- every loaded scalar has an immediate role
-- the staging writes are visible as explicit assignments
-- the swap step is concrete rather than hidden behind helper abstractions
+### Transpose Contracts
 
-For performance-sensitive code like this, explicitness is valuable. The function is longer than the `32x32` helper, but it remains mechanically readable because each phase corresponds to a specific tile transformation.
+For all supported dimensions:
 
-## Validation Notes
+```text
+for every row in [0, N):
+    for every col in [0, M):
+        B[col][row] == A[row][col]
+```
 
-The code was validated on Linux using the provided build system and test tooling. The workflow assumes:
+For `32x32`, the helper assumes:
 
-- Linux `x86_64`
-- `gcc`
-- `make`
-- `valgrind`
-- `python2` for the original driver
+```text
+N == 32
+M == 32
+both dimensions are divisible by 8
+```
 
-This matters because:
+For `64x64`, the helper assumes:
 
-- [test-csim](../test-csim) and [csim-ref](../csim-ref) are Linux ELF binaries
-- the repository's original tooling is not fully portable across modern non-Linux environments
+```text
+N == 64
+M == 64
+both dimensions are divisible by 8
+each 8x8 tile can be split into complete 4x4 quadrants
+```
 
-## Resume-Style Summary
+For the generic helper:
 
-One concise way to describe the current implementation is:
+```text
+no divisibility assumption
+loop guards clip every tile at N and M
+```
 
-> Implemented a cache simulator and a cache-aware matrix transpose in C, achieving perfect simulator correctness and full-score-range miss counts across multiple matrix sizes, including `1227` misses on the hardest `64x64` direct-mapped cache case.
+## Design Tradeoffs
 
-That phrasing accurately reflects what this code does and what the measured results show.
+### Why Store Only Cache Metadata?
+
+The simulator is scored only on hit, miss, and eviction counts. Those counts require:
+
+```text
+valid bit
+tag
+replacement metadata
+```
+
+They do not require block bytes. Avoiding payload storage keeps allocation smaller and avoids irrelevant copy/update logic.
+
+### Why Timestamp-Based LRU?
+
+Timestamp LRU keeps the implementation local to one set:
+
+```text
+on access:
+    increment global timestamp
+    scan target set
+    update matching line or replace oldest line
+```
+
+This is easier to audit than linked-list LRU and efficient enough because `E` is small in the lab workload.
+
+### Why Specialized Transpose Paths?
+
+The three graded matrix shapes have different cache behavior:
+
+```text
+32x32:
+    simple 8x8 blocking works well
+
+64x64:
+    simple 8x8 blocking causes direct-mapped conflicts
+    staged quadrant movement is worth the extra code
+
+61x67:
+    irregular edges dominate implementation complexity
+    clipped 16x16 blocking is sufficient for full-score performance
+```
+
+The code specializes only where specialization pays off.
+
+### Why No Heap Allocation In `trans.c`?
+
+Heap allocation would add extra memory references that appear in the Valgrind trace. It would also violate the spirit of the assignment constraints. The optimized code uses scalar temporaries:
+
+```c
+int a0, a1, a2, a3, a4, a5, a6, a7;
+```
+
+Those temporaries allow the code to hold a small source row segment while writing to `B`.
+
+### Why Use `B` As Temporary Storage In `64x64`?
+
+The `64x64` case cannot fit an entire `8x8` tile transformation into scalar temporaries without excessive variables. More importantly, the issue is not just storage capacity; it is direct-mapped conflict timing.
+
+The staging pattern:
+
+```text
+UR -> temporary area in B
+LL -> final area in B
+UR -> moved from temporary area to final area
+```
+
+lets the code control when conflicting lines are loaded and overwritten.
+
+## Maintenance Notes
+
+If the simulator is changed, preserve these properties:
+
+- `printSummary` must still be called exactly once on successful simulation.
+- `M` operations must still call `access_cache` twice.
+- `I` operations must not affect counters.
+- malformed command-line input should fail before allocation when possible.
+- allocated cache memory should be released on every post-allocation exit path.
+
+If the transpose code is changed, preserve these properties:
+
+- the submission description must remain exactly `"Transpose submission"`.
+- the `transpose_submit` prototype must not change.
+- `registerFunctions` must register the submission.
+- no helper should read or write outside `A[N][M]` or `B[M][N]`.
+- any added local storage should be considered part of the traced memory behavior.
+
+## Useful Commands
+
+Build:
+
+```bash
+make
+```
+
+Run the simulator directly:
+
+```bash
+./csim -s 4 -E 1 -b 4 -t traces/yi.trace
+./csim -v -s 4 -E 1 -b 4 -t traces/yi.trace
+```
+
+Run the official simulator tests in a Linux-compatible environment:
+
+```bash
+./test-csim
+```
+
+Run transpose workloads in a Linux-compatible environment with Valgrind:
+
+```bash
+./test-trans -M 32 -N 32
+./test-trans -M 64 -N 64
+./test-trans -M 61 -N 67
+```
+
+Run the original full driver:
+
+```bash
+python2 ./driver.py
+```
+
+Clean generated files:
+
+```bash
+make clean
+```
+
+## Review Checklist
+
+For [csim.c](../csim.c):
+
+- Does every data access increment `timestamp` exactly once?
+- Does every hit update `last_used`?
+- Does a miss prefer an invalid line before evicting?
+- Does eviction choose the minimum `last_used` among valid lines?
+- Are `I` operations ignored?
+- Are `M` operations counted as two accesses?
+- Are `s`, `E`, and `b` validated before shifts and allocation?
+- Is memory freed on all post-allocation exits?
+
+For [trans.c](../trans.c):
+
+- Does `transpose_submit` route each graded dimension to the intended helper?
+- Does each helper preserve `B[col][row] == A[row][col]`?
+- Does `32x32` process exactly complete `8x8` tiles?
+- Does `64x64` preserve the staged `UR` values before overwriting the staging area?
+- Does the generic helper clip both row and column bounds?
+- Does the submission description string remain unchanged?
+
+For the harness:
+
+- Does `test-trans` still use `eval_perf(5, 1, 5)`?
+- Does `tracegen` still emit marker accesses around each tested function?
+- Does `driver.py` still use the same miss thresholds?
+
+## Summary
+
+The codebase implements a complete Cache Lab solution with two focused designs:
+
+- [csim.c](../csim.c) is a metadata-only set-associative cache simulator with validated CLI parsing, explicit allocation, timestamp-based LRU, reference-style trace processing, and correct summary reporting.
+- [trans.c](../trans.c) is a cache-aware transpose implementation that uses `8x8` blocking for `32x32`, staged quadrant movement for the conflict-heavy `64x64` case, and clipped `16x16` blocking for irregular sizes such as `61x67`.
+
+The measured results show that the implementation is not merely correct:
+
+```text
+cache simulator: 27/27
+32x32 transpose: 287 misses
+64x64 transpose: 1227 misses
+61x67 transpose: 1992 misses
+```
+
+Those results line up with the design choices: the simulator models exactly the metadata needed for reference behavior, and the transpose code adjusts its memory-access schedule to the cache geometry that the driver actually measures.
